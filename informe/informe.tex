@@ -1,0 +1,231 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage[colorlinks=true,urlcolor=blue!60!black,linkcolor=black]{hyperref}
+
+\definecolor{termbg}{gray}{0.95}
+\lstdefinestyle{term}{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{termbg},
+  frame=single, rulecolor=\color{gray!50},
+  columns=fullflexible, keepspaces=true,
+  breaklines=true, xleftmargin=4pt, xrightmargin=4pt,
+  literate={á}{{\'a}}1 {é}{{\'e}}1 {í}{{\'i}}1 {ó}{{\'o}}1 {ú}{{\'u}}1
+           {ñ}{{\~n}}1 {¡}{{!`}}1 {→}{{$\to$}}1
+}
+\lstset{style=term}
+\newcommand{\cmd}[1]{\texttt{#1}}
+\setlist{itemsep=2pt,topsep=4pt}
+
+\title{\textbf{rvsim: Simulador de RISC-V (RV32I)}\\[2pt]
+\large CS3051 Arquitectura de Computadores 2026-II --- Tarea 5}
+\author{Ary Werner Aaron Rojas Durand}
+\date{19 de noviembre de 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Enlaces de la entrega}
+\begin{itemize}
+  \item \textbf{Repositorio Git:} \url{https://github.com/USUARIO/REPOSITORIO} % <-- reemplazar
+  \item \textbf{Carpeta de Google Drive} (video demostrativo + código fuente en ZIP):
+        \url{https://drive.google.com/drive/folders/ID_DE_LA_CARPETA} % <-- reemplazar
+\end{itemize}
+
+\section{Resumen}
+\textbf{rvsim} es un simulador del ISA base RISC-V de 32 bits (RV32I) con interfaz de terminal. Carga un programa
+ya compilado, sea un binario crudo exportado de CPUlator o un ejecutable ELF, a partir de la dirección
+\cmd{0x00000000}. Luego lo ejecuta instrucción por instrucción bajo control del usuario y permite inspeccionar en
+cualquier momento el contador de programa (PC), los 32 registros y la memoria. No es un ensamblador: su entrada es
+código máquina.
+
+Cumple los cuatro requisitos obligatorios del enunciado e implementa tres de las cuatro ideas adicionales:
+syscalls de SPIM, carga de ELF y desensamblador. También incluye breakpoints, un modo de traza y un mecanismo de
+verificación automática que se usa en las pruebas.
+
+\section{Lenguaje y organización del código}
+El simulador está escrito en \textbf{C++17} estándar, sin dependencias externas, y compila con g++, clang o
+MinGW mediante CMake o \cmd{make}. Se eligió un lenguaje de sistemas porque simular un ISA es, sobre todo,
+manipular campos de bits y aritmética entera de 32 bits. Con \cmd{uint32\_t} el desborde es modular, igual que en
+el hardware, e \cmd{int32\_t} se usa solo donde la instrucción interpreta los operandos con signo.
+
+El código separa un \emph{núcleo}, que modela el procesador y no imprime nada, de la \emph{interfaz}:
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+Capa & Módulo (\cmd{src/}) & Responsabilidad \\
+\midrule
+Núcleo & \cmd{isa} & Decodificación: campos, inmediatos de los formatos I/S/B/U/J e identificación de la instrucción. \\
+       & \cmd{cpu} & Estado arquitectural (PC, \cmd{x0}--\cmd{x31}) y ciclo fetch--decode--execute--write-back. \\
+       & \cmd{memory} & Memoria plana little-endian de 32 bits, paginada. \\
+       & \cmd{syscalls} & Servicios \cmd{ecall} al estilo SPIM (consola, \cmd{exit}, \cmd{sbrk}, tiempo). \\
+       & \cmd{loader} & Carga de binarios crudos y de ELF32 (parser propio, sin \cmd{<elf.h>}). \\
+Interfaz & \cmd{disasm} & Desensamblador con nombres ABI y pseudoinstrucciones. \\
+       & \cmd{debugger} & Intérprete de comandos: ejecución, inspección, breakpoints, verificaciones. \\
+       & \cmd{main} & Opciones de línea de comandos. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+La CPU devuelve, por cada paso, un \cmd{Event} (normal, fin del programa, \cmd{ebreak}, error) y, si se le pide,
+un \cmd{StepRecord} con lo que cambió: el registro destino con su valor anterior y nuevo, la escritura en memoria y
+si hubo salto. La terminal decide cómo mostrarlo. Las syscalls se conectan a través de la interfaz
+\cmd{SyscallHandler}, así que el núcleo podría reutilizarse con otra interfaz sin modificarse.
+
+\subsection{Ciclo de ejecución}
+\cmd{Cpu::step()} ejecuta una instrucción en cuatro etapas:
+\begin{enumerate}
+  \item \textbf{Fetch:} lee los 4 bytes en \cmd{pc} y los arma en orden little-endian. Si el PC no está alineado a
+        4, se reporta un error.
+  \item \textbf{Decode:} extrae \cmd{opcode}, \cmd{rd}, \cmd{funct3}, \cmd{rs1}, \cmd{rs2} y \cmd{funct7}, arma el
+        inmediato según el formato con extensión de signo e identifica la instrucción exacta. Las combinaciones que
+        no son RV32I se marcan como \emph{ilegales} con un motivo: \cmd{funct7} inválido, \cmd{slli} con
+        \cmd{imm[11:5]}~$\neq 0$, instrucciones de la extensión M, instrucciones comprimidas o la palabra
+        \cmd{0x00000000}.
+  \item \textbf{Execute:} un \cmd{switch} sobre la instrucción calcula el resultado, la dirección efectiva de
+        loads y stores o la condición del branch.
+  \item \textbf{Write-back y PC:} escribe \cmd{rd} (nunca \cmd{x0}) y actualiza \cmd{pc} a $pc+4$ o al destino del
+        salto. En \cmd{jalr} se limpia el bit 0 del destino, y un destino no alineado a 4 produce el error
+        \emph{instruction-address-misaligned}.
+\end{enumerate}
+
+\subsection{Memoria}
+El espacio de direcciones es de $2^{32}$ bytes, direccionable por byte y little-endian. Como reservar 4\,GiB no es
+viable, la memoria se guarda como un \cmd{unordered\_map} de páginas de 4\,KiB que se crean la primera vez que se
+escriben. Leer una dirección que nunca se escribió devuelve 0 sin crear la página. Los accesos de 16 y 32 bits se
+arman byte a byte, de modo que el orden de bytes es explícito y funcionan aunque crucen el borde de una página.
+
+\section{Características}
+\subsection*{Requisitos obligatorios}
+\begin{itemize}
+  \item \textbf{Las 37 instrucciones del Anexo A.}
+        Loads: \cmd{lb lh lw lbu lhu}.
+        OP-IMM: \cmd{addi slli slti sltiu xori srli srai ori andi}.
+        Upper: \cmd{lui auipc}.
+        Stores: \cmd{sb sh sw}.
+        OP: \cmd{add sub sll slt sltu xor srl sra or and}.
+        Branches: \cmd{beq bne blt bge bltu bgeu}.
+        Saltos: \cmd{jal jalr}.
+        Además se reconocen \cmd{ecall}, \cmd{ebreak} y \cmd{fence} (como \emph{nop}).
+  \item \textbf{Memoria little-endian} de 32 bits.
+  \item \textbf{Carga de binarios crudos} en \cmd{0x00000000} (la dirección es configurable con \cmd{--base}).
+  \item \textbf{Ejecución paso a paso} con \cmd{step [n]}; \emph{Enter} vacío repite el último paso.
+  \item \textbf{Inspección} de PC (\cmd{pc}), registros (\cmd{regs}) y memoria (\cmd{mem}, \cmd{words}, \cmd{dump}).
+\end{itemize}
+
+\subsection*{Ideas adicionales implementadas}
+\begin{itemize}
+  \item \textbf{Syscalls de SPIM} vía \cmd{ecall}, con el servicio en \cmd{a7} como en CPUlator:
+        1 print\_int, 4 print\_string, 5 read\_int, 8 read\_string, 9 sbrk, 10 exit, 11 print\_char,
+        12 read\_char, 17 exit2, 30 time, 32 sleep, 34 print\_hex, 35 print\_bin y 36 print\_uint. También se acepta
+        el 93 (exit de Linux), que usan los programas en C.
+  \item \textbf{Carga de ELF32}: segmentos \cmd{PT\_LOAD} (con relleno en cero de \cmd{.bss}), punto de entrada
+        \cmd{e\_entry} y tabla de símbolos. Los símbolos se usan en breakpoints (\cmd{break main}), en expresiones
+        (\cmd{words primos 10}) y en el desensamblado (\cmd{<criba+12>}).
+  \item \textbf{Desensamblador}: cada \cmd{step} muestra la instrucción en ejecución, y \cmd{dis} lista cualquier
+        rango, con nombres ABI y la pseudoinstrucción equivalente (\cmd{li}, \cmd{mv}, \cmd{j}, \cmd{call},
+        \cmd{ret}, \cmd{beqz}, \ldots).
+\end{itemize}
+No se implementó el soporte para GDB.
+
+\subsection*{Otras funciones}
+\begin{itemize}
+  \item Breakpoints por dirección o símbolo; \cmd{ebreak} pausa la ejecución y Ctrl+C detiene un \cmd{run} largo.
+  \item \cmd{trace on}: durante \cmd{run} se muestra cada instrucción con sus efectos.
+  \item Errores explícitos: instrucción ilegal (con su motivo), PC o salto desalineado, syscall desconocida y
+        entrada agotada. La CPU queda detenida y \cmd{reset} recarga el programa desde el archivo.
+  \item Detección del fin típico de los programas de CPUlator (\cmd{end: j end}, un salto a sí mismo).
+  \item Modos sin terminal: \cmd{--run}, scripts (\cmd{-x}) y comandos en línea (\cmd{-c}), con verificaciones
+        \cmd{expect} para pruebas automáticas.
+\end{itemize}
+
+\section{Uso}
+\begin{lstlisting}
+cmake -B build && cmake --build build      # o: make
+./build/rvsim programas/riscvtest.bin       # terminal interactiva
+./build/rvsim -r programas/quicksort.bin    # ejecutar de corrido
+\end{lstlisting}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+Comando & Descripción \\
+\midrule
+\cmd{step [n]} & Ejecuta $n$ instrucciones (1 por defecto) mostrando sus efectos. \\
+\cmd{run [max]} & Ejecuta hasta el fin del programa, un breakpoint, \cmd{ebreak}, un error o \cmd{max} instrucciones. \\
+\cmd{break <dir|símbolo>}, \cmd{delete [dir]} & Pone o quita breakpoints. \\
+\cmd{pc [valor]} & Muestra o cambia el PC. \\
+\cmd{regs [r \ldots]} & Los 32 registros (marca con \cmd{*} los modificados) o solo los indicados. \\
+\cmd{mem <ini> [fin]} & Bytes de memoria en el rango, en el formato del ejemplo del enunciado. \\
+\cmd{words}, \cmd{dump}, \cmd{str} & Palabras de 32 bits, volcado hexadecimal + ASCII o una cadena. \\
+\cmd{dis [dir] [n]} & Desensambla $n$ instrucciones. \\
+\cmd{set}, \cmd{setmem} & Modifican un registro o la memoria. \\
+\cmd{info}, \cmd{reset}, \cmd{load}, \cmd{help}, \cmd{exit} & Estado general, recarga, otro programa, ayuda, salir. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\noindent Las direcciones y los valores aceptan \cmd{4096}, \cmd{0x1000}, \cmd{-1}, un registro (\cmd{sp}), un
+símbolo (\cmd{main}) o una suma o resta simple (\cmd{sp+8}). Ejemplo de sesión:
+
+\begin{lstlisting}
+$ ./build/rvsim programas/riscvtest.bin
+"programas/riscvtest.bin" cargado a memoria. Escribe 'help' para ver los comandos.
+> step
+   0x00000000:  00500113  addi   sp, zero, 5          # li sp, 5
+                          sp: 0x00000000 -> 0x00000005  (5)
+> run
+Fin del programa: salto a sí mismo en 0x00000050 (bucle final del programa).
+Ejecutadas 18 instrucciones. PC = 0x00000050
+> mem 0x64 0x67
+Memoria (0x64-0x67): 19 00 00 00
+\end{lstlisting}
+
+\section{Verificación}
+El simulador se probó con los tres programas que recomienda el enunciado y con cuatro programas propios. Cada uno
+tiene un script en \cmd{tests/} que verifica el resultado con \cmd{expect}, y todos pasan
+(\cmd{make test} o \cmd{ctest}).
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l X l@{}}
+\toprule
+Programa & Qué prueba & Resultado \\
+\midrule
+\cmd{riscvtest.bin} & add, sub, and, or, slt, addi, lw, sw, beq, jal & \cmd{mem[0x64] = 25} \\
+\cmd{quicksort.bin} & Recursión, pila, loads y stores sobre un arreglo & \{1,2,3,4,6,8,9\} en \cmd{0x1000} \\
+\cmd{arbol.bin} & \cmd{is\_symmetric} sobre \{6,4,4,1,2,2,1\} & \cmd{a0 = 1} \\
+\cmd{rv32i\_suite.bin} & Las 37 instrucciones, 46 casos (signo, overflow, shifts $\geq 32$, offsets negativos) & 46/46 OK \\
+\cmd{fibonacci.bin} & Syscalls de lectura y escritura; serie guardada en memoria & \cmd{fib(10) = 55} \\
+\cmd{primos.elf} & Programa en C cargado como ELF, breakpoint por símbolo & primos $\leq N$ \\
+\cmd{invalida.bin} & \cmd{mul} (extensión M) dentro de un programa & error explícito en \cmd{0xC} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Además, durante el desarrollo se hicieron dos pruebas diferenciales:
+\begin{itemize}
+  \item \textbf{Decodificador:} 3000 instrucciones RV32I aleatorias, de todos los formatos y con inmediatos y
+        registros al azar, ensambladas con LLVM. Su desensamblado coincidió en el 100\,\% de los casos con el de
+        \cmd{llvm-objdump}.
+  \item \textbf{Ejecución:} 150 programas aleatorios de 60 instrucciones (aritméticas, lógicas, shifts, loads y
+        stores) se ejecutaron en el simulador y en un modelo de referencia independiente escrito en Python. Los
+        32 registros finales coincidieron en todos los casos.
+\end{itemize}
+
+\section{Limitaciones}
+Solo se implementa el ISA base RV32I: las extensiones M, A, F, D y C y las instrucciones CSR se reportan como
+ilegales. No hay modos de privilegio, excepciones con \emph{trap handler} ni soporte para GDB. Los accesos a
+memoria no alineados se permiten y se resuelven byte a byte, una de las opciones válidas según la especificación.
+
+\end{document}
